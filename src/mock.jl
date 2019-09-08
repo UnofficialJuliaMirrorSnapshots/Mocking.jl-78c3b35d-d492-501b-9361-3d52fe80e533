@@ -1,8 +1,9 @@
 macro mock(expr)
+    NULLIFIED[] && return esc(expr)  # Convert `@mock` into a no-op for maximum performace
+
     isa(expr, Expr) || error("argument is not an expression")
     expr.head == :do && (expr = rewrite_do(expr))
     expr.head == :call || error("expression is not a function call")
-    ENABLED::Bool || return esc(expr)  # @mock is a no-op when Mocking is not ENABLED
 
     target = expr.args[1]
     args = filter(!Mocking.iskwarg, expr.args[2:end])
@@ -11,18 +12,21 @@ macro mock(expr)
     args_var = gensym("args")
     alternate_var = gensym("alt")
 
-    # Note: The fix to Julia issue #265 (PR #17057) introduced changes where no compiled
-    # calls could be made to functions compiled afterwards. Since the `Mocking.apply`
-    # do-block syntax compiles the body of the do-block function before evaluating the
-    # "outer" function this means our patch functions will be compiled after the "inner"
-    # function.
+    # Due to how world-age works (see Julia issue #265 and PR #17057) when
+    # `Mocking.activated` is overwritten then all dependent functions will be recompiled.
+    # When `Mocking.activated() == false` then Julia will optimize the
+    # code below to have zero-overhead by only executing the original expression.
     result = quote
-        local $args_var = tuple($(args...))
-        local $alternate_var = Mocking.get_alternate($target, $args_var...)
-        if $alternate_var !== nothing
-            Base.invokelatest($alternate_var, $args_var...; $(kwargs...))
+        if Mocking.activated()
+            local $args_var = tuple($(args...))
+            local $alternate_var = Mocking.get_alternate($target, $args_var...)
+            if $alternate_var !== nothing
+                $alternate_var($args_var...; $(kwargs...))
+            else
+                $target($args_var...; $(kwargs...))
+            end
         else
-            $target($args_var...; $(kwargs...))
+            $target($(args...); $(kwargs...))
         end
     end
 
@@ -34,18 +38,27 @@ function get_alternate(pe::PatchEnv, target, args...)
         m, f = dispatch(pe.mapping[target], args...)
 
         if pe.debug
-            @info "calling mocked method: $m"
+            if m !== nothing
+                @info _debug_msg(m, target, args)
+            else
+                target_m, _ = dispatch([target], args...)
+                @info _debug_msg(target_m, target, args)
+            end
         end
 
         return f
     else
-        if pe.debug
-            m, f = dispatch([target], args...)  # just looking up `m` for logging purposes
-            @info "calling original method: $m"
-        end
-
         return nothing
     end
 end
 
 get_alternate(target, args...) = get_alternate(get_active_env(), target, args...)
+
+function _debug_msg(method::Method, target, args)
+    call = "$target($(join(map(arg -> "::$(Core.Typeof(arg))", args), ", ")))"
+    return """
+        Mocking intercepted:
+        call:       $call
+        dispatched: $method
+        """
+end
